@@ -253,25 +253,49 @@ class MultiHeadAttention(nn.Module):
 
 
 class LayerNorm(nn.Module):
+    """Layer Normalization：对每个样本、每个 token 的嵌入维度独立做归一化。
+    公式：y = gamma * (x - mean) / sqrt(var + eps) + beta
+    作用：稳定深层网络的数值分布，避免激活值过大/过小；gamma/beta 可学习，恢复表达能力。
+    """
     def __init__(self, embed_dim):
         super().__init__()
+        # gamma (缩放参数)：shape=(E,)，初始化为 1，训练中学习每个维度的"理想标准差倍数"
         self.gamma = nn.Parameter(torch.ones(embed_dim))
+        # beta  (偏移参数)：shape=(E,)，初始化为 0，训练中学习每个维度的"理想均值偏移"
         self.beta = nn.Parameter(torch.zeros(embed_dim))
+        # eps 数值稳定性常数：防止 var≈0 时出现除零错误
         self.eps = 1e-5
 
     def forward(self, x):
+        # 输入 x shape 通常为 (B, C, E)
+        # dim=-1：对最后一维（嵌入维度 E）求均值，即每个 token 独立算自己的均值；
+        # keepdim=True 保留维度为 (B, C, 1)，方便后续广播减法
         mean = x.mean(dim=-1, keepdim=True)
+        # 计算每个 token 的 E 维方差；unbiased=False 使用有偏估计（除以 N），
+        # 与 PyTorch 官方 nn.LayerNorm 行为保持一致
         var = x.var(dim=-1, keepdim=True, unbiased=False)
+        # 标准化：先减均值使均值=0，再除以 √(方差+eps) 使方差≈1；广播后 shape 仍为 (B, C, E)
         norm_x = (x - mean) / torch.sqrt(var + self.eps)
+        # 可学习仿射变换：逐维度缩放（gamma）+ 偏移（beta），恢复网络需要的分布幅度；
+        # 初始 gamma=1、beta=0 等价于恒等映射，训练中逐步学到最佳归一化强度
         return self.gamma * norm_x + self.beta
 
 
 class GELU(nn.Module):
+    """Gaussian Error Linear Unit 激活函数。
+    近似公式：GELU(x) = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 x³)))
+    含义：x 乘以"x 大于高斯噪声的概率"（≈ 0.5*(1+erf(x/√2)) 的 tanh 近似），
+    是一种平滑、处处可导的"软门控"激活，相比 ReLU 硬截断更稳定，是 GPT/BERT 等 Transformer 的标配。
+    """
     def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) *
-            (x + 0.044715 * torch.pow(x, 3))
-        ))
+        # cdf 近似项：√(2/π) ≈ 0.7979，将输入经三次项微调后送入 tanh，
+        # 近似标准正态分布的累积分布函数 Φ(x) = P(N(0,1) ≤ x)
+        cdf_term = torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))
+        # GELU(x) = x * Φ(x)  的 tanh 近似：
+        #   x > 0 时 Φ(x)≈1 → 输出≈x（近似通过）；
+        #   x < 0 时 Φ(x)≈0 → 输出≈0（近似被门控掉但保留微小斜率，无梯度死亡）；
+        #   整体处处可导且平滑，训练比 ReLU 更稳定
+        return 0.5 * x * (1 + torch.tanh(cdf_term))
 
 
 class FFN(nn.Module):
