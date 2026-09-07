@@ -299,16 +299,32 @@ class GELU(nn.Module):
 
 
 class FFN(nn.Module):
+    """Feed-Forward Network 前馈网络（Position-wise FFN）。
+    结构：Linear(E → ff_dim) → GELU → Linear(ff_dim → E) → Dropout
+    作用：与 MultiHeadAttention 互补 —— MHA 在"不同 token 之间搬信息"（跨 token 交互），
+    而 FFN 对"每个 token 单独"做非线性特征加工（token 内特征变换），互不干扰。
+    通常 hidden_dim = 4 × embed_dim（Transformer 论文经验值，升维再降维提供充足表达能力。
+    """
     def __init__(self, embed_dim, hidden_dim, dropout_rate):
         super().__init__()
         self.layers = nn.Sequential(
+            # 第1层：升维线性变换 E → hidden_dim，将 token 的表示投射到更高维的特征空间，
+            # 以便后续非线性可以学习更丰富的特征组合
             nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),  # GELU()
+            # GELU 非线性激活：提供非线性表达能力（类似神经元的门控开关），
+            # 相比 ReLU 更平滑，训练更稳定
+            nn.GELU(),
+            # 第2层：降维线性变换 hidden_dim → E，将高维特征压缩回原始嵌入维度，
+            # 以便 Block 尾部的残差连接 x + ffn(x) 维度匹配
             nn.Linear(hidden_dim, embed_dim),
+            # Dropout：随机丢弃部分输出神经元，正则化，防止过拟合
             nn.Dropout(dropout_rate)
         )
 
     def forward(self, x):
+        # 直接走 Sequential 流水线；输入输出 shape 相同 = (B, C, E)，与 MHA 一致
+        # 注意：Linear 作用于最后一维，所以所有 token 独立通过同一组权重，
+        # 即"逐位置 (position-wise)"——位置间互不交流
         return self.layers(x)
 
 
