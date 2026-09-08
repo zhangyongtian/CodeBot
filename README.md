@@ -334,14 +334,35 @@ python src/grpo.py
 
 **用途**：加载 `models/model_pretrain.pt`，以 `"def"` 为 prompt 生成 5 段独立的代码样本，直观检查预训练质量。
 
-**前置条件**：已完成 Step 1（预训练）。
+**前置条件**：已完成 Step 1（预训练），且 `models/model_pretrain.pt` 文件存在。
 
 **执行命令：**
 ```bash
 python test/test_generate.py
 ```
 
+**可调节参数**（在 [test/test_generate.py](test/test_generate.py) 顶部修改）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `prompt` | `"def"` | 生成起始提示词，可改为 `"class"`、`"import"` 等观察不同生成效果 |
+| `max_new_tokens` | `200` | 单次生成的最大 token 数量 |
+| `temperature` | `1.0` | 采样温度：`0` = 贪心解码（确定性最高），值越大随机性/多样性越强 |
+
 **预期输出**：打印 5 段以 `def` 开头的合成代码片段，语法应当逐步合理（训练步数越多越接近真实 Python 代码）。
+
+```
+--- 样本 1 ---
+def add(a, b):
+    return a + b
+
+--- 样本 2 ---
+def hello():
+    print("Hello, World!")
+...
+```
+
+> **提示**：如果训练步数较少（< 500 步），生成结果可能是乱码或无意义字符，这是正常现象。建议至少训练 2000 步以上再观察生成效果。
 
 ---
 
