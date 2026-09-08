@@ -123,6 +123,49 @@ class SFTDataset(Dataset):
         #   pad_len > 0：样本太短，尾部填充 [0]（tiktoken gpt2 中 ID=0 是 '!'，无关紧要，因为 labels 用 -100 掩码了）
         #   pad_len < 0：样本太长，尾部截断，丢弃超出 context_len 的部分（可能丢失部分回答末尾）
         pad_len = self.context_len - len(ids)
+        # ─────────────────────────────────────────────────────────────────────
+        # 【具体 token 举例】（完整走一遍 Step 2 拼接掩码 → Step 3 移位 → Step 4 Padding）
+        #   训练样本：instruction="写hi", response="你好"
+        #
+        # Step 2【拼接 + 掩码（移位前）】总长 = prompt_ids(6) + response_ids(3) = 9
+        #   prompt_ids   = [###, Instruction:, 写, hi, ###, Response:]      ← 6 个 token，包装后的指令区
+        #   response_ids = [你, 好, <|endoftext|>]                           ← 3 个 token，回答 + EOS 结束符
+        #   ids_before_shift    = [###, Instruction:, 写, hi, ###, Response:, 你, 好, <|endoftext|>]  ← 长 9
+        #   labels_before_shift = [-100, -100,          -100,-100,-100, 你,       好, <|endoftext|>]
+        #                         ↑──── Prompt 区 6 个全掩码 -100（不监督复述指令）───↑ ↑ Response 区 3 个真实值 ↑
+        #
+        # Step 3【Teacher Forcing 移位】ids 去掉最后一位，labels 去掉第一位，长度都变成 8
+        #   核心规则：ids[i] 是"模型看到的输入 token"，labels[i] 是"模型应该预测的下一个 token"
+        #   ids    = [###, Instruction:, 写, hi, ###, Response:, 你, 好]   ← 长度 8（就是 ids_before_shift[:-1]，少了最末尾的 <|endoftext|>）
+        #   labels = [-100, -100,      -100,-100,-100, 你,       好, <|endoftext|>]  ← 长度 8（就是 labels_before_shift[1:]）
+        #                                                                       ↑ 注意这个位置：
+        #   逐位对应关系：                                                         ids[7]="好" 对应的监督是 labels[7]="<|endoftext|>"，
+        #     i=0: 看到 "###"           → 预测 (-100 跳过)                    即"看到'好'这个字 → 接下来应该输出 EOS 停止"
+        #     i=1: 看到 " Instruction:"  → 预测 (-100 跳过)
+        #     i=2: 看到 "写"            → 预测 (-100 跳过)
+        #     i=3: 看到 "hi"           → 预测 (-100 跳过)
+        #     i=4: 看到 "###"           → 预测 (-100 跳过)
+        #     i=5: 看到 " Response:"    → 预测 "你"       ← ✅ 关键："Response:" 这个 token 虽然属于 Prompt 但在 ids 里，
+        #     i=6: 看到 "你"            → 预测 "好"                          它的作用是"触发模型开始输出回答"；
+        #     i=7: 看到 "好"            → 预测 "<|endoftext|>"                但 labels[i=5] 从这里开始才是真实监督。
+        #
+        # ── 场景 A：假设 context_len=10（需 Padding 2 位）──
+        #   pad_len = 10 - 8 = 2
+        #   ids    补: [###, Instruction:, 写, hi, ###, Response:, 你, 好, 0,    0   ]
+        #   labels 补: [-100, -100,      -100,-100,-100, 你,       好, <|endoftext|>, -100, -100]
+        #                                                                      ↑ padding 位全 -100 掩码
+        #                                                                   ↑ ids padding 填 0 或任意值都没关系，
+        #                                                                     因为对应 labels 已经是 -100
+        #
+        # ── 场景 B：假设 context_len=7（需 Truncation，尾部砍掉 1 位）──
+        #   pad_len = 7 - 8 = -1
+        #   ids    截: [###, Instruction:, 写, hi, ###, Response:, 你]   ← 砍掉了最后一位 "好"
+        #   labels 截: [-100, -100,      -100,-100,-100, 你,       好]   ← 砍掉了最后一位 "<|endoftext|>"
+        #   ⚠️ 实际风险：原本应该学到的"看到'好'→ 输出 EOS 停止"这一条关键监督信号被截断丢失了。
+        #              大量样本截断在 Response 末尾的话，模型会学不到"回答完应该停下来输出 <|endoftext|>"
+        #              的习惯，推理时可能出现"回答停不下来、一直胡编续写"的问题。
+        #              所以 context_len 要覆盖数据集中最长的"指令+回答"总长度。
+        # ─────────────────────────────────────────────────────────────────────
         if pad_len > 0:
             ids = ids + [0] * pad_len
             labels = labels + [-100] * pad_len  # Padding 部分同样标记为 -100，不参与损失
@@ -136,7 +179,49 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # 从 self.samples 中取出第 idx 条样本（Python list[int] 格式，省内存便于多进程加载）
         ids, labels = self.samples[idx]
+        # ====================================================================
+        # 返回的两个 Tensor：把 Python list 转为 PyTorch 模型要求的 LongTensor
+        # 为什么必须用 torch.long (= torch.int64)？
+        #   1. GPT 内部 nn.Embedding(V, E) 做查表时，indices 必须是 int64
+        #   2. F.cross_entropy 的 target 参数必须是 int64 类别索引
+        #   用 int32/float 都会直接报错。
+        #
+        # 【真实数值样例】以 tiny_codes_sft.json 第 0 条（instruction="Hello",
+        #   response="Hello. What can I help you with?"）、context_len=256 为例，
+        #   严格按照 Step 2 拼接掩码 → Step 3 Teacher Forcing 移位 后的状态：
+        #
+        #  Step 2 拼接掩码（移位前，总长 20 = prompt_ids(10) + response_ids(10)）：
+        #    ids_before_shift[0:10]  = [###, Inst, :, \n, Hello, \n\n, ###, Resp, :, \n]  ← prompt_ids
+        #    ids_before_shift[10:20] = [Hello, ., What, can, I, help, you, with, ?, <eos>] ← response_ids
+        #    labels_before_shift[0:10]  = 全 -100（prompt 区掩码）
+        #    labels_before_shift[10:20] = [Hello, ., What, can, I, help, you, with, ?, <eos>] ← response 区真实监督
+        #
+        #  Step 3 移位：ids = ids_before_shift[:-1]  (丢末尾 <eos>，长 19)
+        #               labels = labels_before_shift[1:]  (丢首位 -100，长 19)
+        #
+        #  ① ids_tensor：shape=(256,), dtype=torch.int64
+        #     前 19 位有效 token（gpt2 真实 ID，与 ids_before_shift[:-1] 完全一致）：
+        #       索引  :   0     1     2    3     4     5    6     7    8    9 |  10    11   12    13   14    15    16    17   18
+        #       ID    : [21790, 16288,   25,  198, 15496,  271, 21790, 18261,  25,  198, 15496,  13, 1867,  460,  314, 1037,  345,  351,  30]
+        #       解码  : "###"  " Inst" ":" "\n" "Hello" "\n\n" "###" " Resp" ":" "\n" "Hello" "." " Wh" " ca" " I"  " hel" " you" " wi" "?"
+        #     后 237 位 = 全 0（padding，填什么都行，因为 labels 对应位置是 -100）
+        #
+        #  ② labels_tensor：shape=(256,), dtype=torch.int64（与 ids 同长，逐位对应 Teacher Forcing）
+        #     前 9 位 = 全 -100（prompt 区，看到 "###"~":" 这些位置都不监督）
+        #     第 9~18 位（response 区，真实监督信号，共 10 位 = labels_before_shift[10:20]）：
+        #       索引  :   9     10   11    12    13   14     15     16    17    18
+        #       ID    : [15496,  13, 1867,  460,  314,  1037,   345,   351,    30, 50256]
+        #       解码  : "Hello" "." " Wh" " ca" " I"   " hel" " you" " wi"   "?"  "<|endoftext|>"
+        #     逐位含义（ids[i] 输入 → labels[i] 预测目标）：
+        #       i=9 :  ids[9]="\n"(Response: 后换行)  →  预测 "Hello"  ← 回答开始！
+        #       i=10:  ids[10]="Hello"                →  预测 "."
+        #       i=11:  ids[11]="."                    →  预测 " What"
+        #       ...     中间依此类推 ...
+        #       i=18:  ids[18]="?"                    →  预测 "<|endoftext|>"  ← 回答结束，教模型输出 EOS 停止
+        #     后 237 位 = 全 -100（padding 区，同样掩码）
+        # ====================================================================
         return torch.tensor(ids, dtype=torch.long), \
             torch.tensor(labels, dtype=torch.long)
 
@@ -156,6 +241,13 @@ data_iter = cycle(dataloader)
 pbar = tqdm(range(max_iters))
 
 for i in pbar:
+    # DataLoader 取 batch（内部：生成 16 个随机 idx → 逐个调用 __getitem__ → torch.stack(dim=0) 拼接）
+    # 【关于 ids/labels 的错位关系、-100 掩码语义、逐位对应规则：已在上面 __getitem__ 的注释中完整讲解】
+    # 这里只说明多了 batch 维度之后的形状变化（batch_size=16, context_len=256, vocab_size=50257）：
+    #   batch_x : (16, 256)  int64  每一行 = 1 条样本的 ids_tensor
+    #   batch_y : (16, 256)  int64  每一行 = 对应的 labels_tensor（-100 = 掩码跳过，0~50256 = 真实监督）
+    #   logits  : (16, 256, 50257)  float32  →  model(batch_x) 得到每个位置对词表的打分
+    #   cross_entropy: logits.view(B*T, V) 与 batch_y.view(B*T) 逐位置计算，-100 的位置被忽略
     batch_x, batch_y = next(data_iter)
     batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
