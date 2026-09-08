@@ -468,8 +468,46 @@ class GPT(nn.Module):
         # Final LayerNorm：n_layer 层残差累加后数值可能飘，统一拉回标准分布 (B, C, E)
         x = self.norm(x)
 
-        # unembed：每个 token 位置的 E 维表示线性投影到 V 维词表空间，得到 logits
-        #   logits[b][c][v] = 第 b 条句子第 c 个位置预测词 v 为下一个词的未归一化分数
+        # ──────────────────────────────────────────────────────────────────
+        # unembed 层（反向词嵌入）：E 维语义向量 → V 维词表打分（logits）
+        # ──────────────────────────────────────────────────────────────────
+        # 数学操作：x (B, C, E) 与 unembed.weight (V, E) 做矩阵乘法 → logits (B, C, V)
+        #   · 本质：与 embed 层"id → 向量"互为逆操作（embed 是查表，unembed 是反查表）
+        #   · 权重共享（__init__ 第 425 行 embed.weight = unembed.weight）：
+        #     同一个 (V, E) 矩阵同时用于"编码 token 为向量"和"解码向量为词分数"，
+        #     语义对齐（词 i 的嵌入方向 = 分类出词 i 的方向），且参数省一半。
+        #
+        # 输出 logits 三维形状 (B, C, V) 的详细含义：
+        #   第 0 维 B = batch_size：第几条句子（共 16 条并行）
+        #   第 1 维 C = context_len：句子中第几个 token 位置（共 256 个位置）
+        #   第 2 维 V = vocab_size = 50257：对应 tiktoken 词表中的每一个 token
+        #     ↳ 索引 v (0 ~ 50256) 与 token id 严格一一对应
+        #       v=0    → "!"
+        #       v=1    → "."
+        #       v=1212 → "def"
+        #       ...
+        #       v=50256 → "<|endoftext|>"（结束符）
+        #
+        # 具体地：logits[b][c][v] = 浮点数分数（未归一化，不是概率）
+        #   含义：第 b 条句子、第 c 个位置，在"看到了前 c+1 个 token (ids[b][0..c])"
+        #         的上下文之后，给"下一个词是第 v 号 token"打多少分。
+        #   分数越高 → 模型认为该词是下一个词的"可能性越大"。
+        #
+        # 为什么每个位置都要产出一整份 V 维打分？——对应训练的 256 个并行监督信号：
+        #   logits[b][0]  (V 维) ← 用 ids[b][0] 预测 → 目标 = ids[b][1]
+        #   logits[b][1]  (V 维) ← 用 ids[b][0..1] 预测 → 目标 = ids[b][2]
+        #   logits[b][2]  (V 维) ← 用 ids[b][0..2] 预测 → 目标 = ids[b][3]
+        #   ...
+        #   logits[b][255] (V 维) ← 用 ids[b][0..255] 预测 → 目标 = ids[b][256]
+        #   （因果掩码保证第 c 位绝对看不到 ids[b][c+1..] 的未来信息）
+        #
+        # 后续使用分两条路径（都沿 V 维度操作）：
+        #   【训练】pretrain.py 第 114 行：沿 V 维算 cross_entropy(softmax(logits), 正确id) → Loss
+        #     → logits.view(-1, V) 把 B*C 个位置拼成 (B*C, V)，当做 50257 类分类任务算交叉熵
+        #     → Loss 越低 = 正确词对应的 v 维度上分数越高 / 其他词分数越低
+        #   【推理/生成】test_generate.py：只取最后一个位置 logits[:, -1, :] → (B, V)
+        #     → F.softmax(..., dim=-1) 沿 V 维归一化为概率 P(v)，总和=1
+        #     → torch.multinomial() 或 argmax() 沿 V 维采样出下一个 token id
         logits = self.unembed(x)
         return logits
 
