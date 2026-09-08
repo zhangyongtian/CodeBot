@@ -164,13 +164,30 @@ def calculate_reward(ground_truth, response):
         return 0.0
 
 
-# 组生成
+# 组生成（Group Sampling）：对每个 prompt 采样 group_size 个回答，再按组计算优势值
+#   输入：
+#       prompts    : 一批问题（长度 = batch_size，如 4 道加法题）
+#       gts        : 与 prompts 一一对应的真实答案 int 列表，仅用于事后算奖励，不进模型
+#       group_size : 每个 prompt 独立采样的回答数（如 8），用于 GRPO「组内归一化」
+#   输出：
+#       all_prompts   : 长度 = batch_size × group_size（如 4×8=32），prompt 被重复 group_size 次
+#       all_responses : 长度同上，每个 prompt 对应的 group_size 个采样回答
+#       all_advantages: (batch_size × group_size,) 的 Tensor，组内优势 = reward - 同组 reward 均值
+#
+#   例（取 batch_size=1, group_size=8, prompt="3+5=?", gt=8）：
+#     采样 8 次 → responses = ["8", "17", "8", "6", "8", "5", "13", "8"]  （temperature=1.0 所以各不相同）
+#     算奖励    → rewards   = [ 1,   0,   1,   0,   1,   0,   0,   1 ]    （答对给 1，答错给 0）
+#     均值 mean = (1+0+1+0+1+0+0+1)/8 = 0.5
+#     优势值    → advantages = rewards - 0.5 = [+0.5,-0.5,+0.5,-0.5,+0.5,-0.5,-0.5,+0.5]
+#       含义：组内「比平均好」的回答（答对）获得正优势，损失下降时概率↑；
+#             组内「比平均差」的回答（答错）获得负优势，损失下降时概率↓。
 def generate_group(model, tokenizer, prompts, gts, group_size):
     all_prompts = []
     all_responses = []
     all_advantages = []
 
     for prompt, gt in zip(prompts, gts):
+        # ── 对当前 prompt 独立采样 group_size 次（temperature=1.0 → 高随机性，保证答案多样性） ──
         responses = []
         for _ in range(group_size):
             full_text = generate(model, tokenizer, prompt, temperature=1.0)
@@ -183,14 +200,22 @@ def generate_group(model, tokenizer, prompts, gts, group_size):
             response = full_text[len(prompt):]
             responses.append(response)
 
+        # ── 用 ground_truth 给这组回答打分（仅做评分员，不进模型 forward） ──
+        #   rewards shape: (group_size,)，每个元素是 0.0 或 1.0
         rewards = torch.tensor([calculate_reward(gt, r) for r in responses])
+        # ── GRPO 组内归一化优势：reward 减去本组 reward 的均值 ──
+        #   优点：不需要额外训练 Critic/Value 网络，直接用组均值做 baseline，
+        #        保证一组内优势值的均值为 0，正负样本自然平衡。
         advantages = rewards - rewards.mean()
 
+        # ── 把「prompt、对应的回答、优势值」一一配对，平铺展开到总列表中 ──
+        #   若 batch_size=4, group_size=8 → 此处循环 4×8=32 次，all_prompts 等列表长度变 32
         for response, advantage in zip(responses, advantages):
             all_prompts.append(prompt)
             all_responses.append(response)
             all_advantages.append(advantage)
 
+    # all_advantages 目前是 list[Scalar Tensor]，用 stack 拼成 (B×group_size,) 的一维 Tensor
     return all_prompts, all_responses, torch.stack(all_advantages)
 
 # 损失函数
