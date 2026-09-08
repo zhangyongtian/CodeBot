@@ -25,6 +25,15 @@ class GRPODataset(Dataset):
         self.data = []
         for i in range(1, 10):
             for j in range(1, 10):
+                # ──────────────────────────────────────────────────────────────
+                # 构造「问题-答案」对的一个样本。
+                # 举例：当 i=3, j=5 时：
+                #   prompt = "### Instruction:\n3+5=\n\n### Response:\n"
+                #              即 Alpaca 风格的输入提示，要求模型填空 "3+5=?"
+                #   ground_truth = 8  (int 类型，正确的数学答案)
+                #   之后 append 到 self.data 的元组：
+                #     ("### Instruction:\n3+5=\n\n### Response:\n", 8)
+                # ──────────────────────────────────────────────────────────────
                 prompt = f"### Instruction:\n{i}+{j}=\n\n### Response:\n"
                 ground_truth = i + j
                 self.data.append((prompt, ground_truth))
@@ -36,29 +45,100 @@ class GRPODataset(Dataset):
         return self.data[idx]
 
     def get_batch(self, prompts, responses, device):
-        all_ids = []
-        all_masks = []
+        all_ids = []   # 存放每个样本的完整 token ID 列表（prompt+response，未填充）
+        all_masks = [] # 存放每个样本对应的损失掩码（未填充）
 
         for prompt, response in zip(prompts, responses):
+            # ── 具体数据形态示例（GPT-2 BPE 词表规则确定，无需运行即可推断） ──
+            # 取 prompt="### Instruction:\n3+5=\n\n### Response:\n"、response="8"：
+            #   prompt_ids (list[int], 长度≈14)：
+            #     [2922,      # "###"
+            #      13093,     # " Instruction"  （带前置空格）
+            #      25,        # ":"
+            #      198,       # "\n"
+            #      18,        # "3"
+            #      10,        # "+"
+            #      30,        # "5"
+            #      28,        # "="
+            #      198,       # "\n"
+            #      198,       # "\n"
+            #      2922,      # "###"
+            #      18261,     # " Response"    （带前置空格）
+            #      25,        # ":"
+            #      198]       # "\n"
+            #   规律：单个数字(0-9)、#、换行、+、=、空格在 GPT-2 BPE 中都是单 token；
+            #         常见英文整词（Instruction / Response）也作为单 token 存储。
+            #
+            #   response_ids (list[int], 长度≈1~2)：
+            #     一位数答案如 "8"  → [26]             （单 token）
+            #     两位数答案如 "17" → [16, 28]         （"1" + "7" 两个 token 拼接）
+            # ─────────────────────────────────────────────────────────────
             prompt_ids = self.tokenizer.encode(
                 prompt, allowed_special={"<|endoftext|>"})
+            # response 是模型生成的原始文本（如 "8"、"17" 等），同样分词为 token IDs
             response_ids = self.tokenizer.encode(
                 response, allowed_special={"<|endoftext|>"})
 
+            # ─────────────────────────────────────────────────────────────
+            # 步骤 2：拼接 tokens，并构造「损失掩码 mask」
+            #  ids  = [prompt_tokens  ... | response_tokens  ...]
+            #  mask = [0, 0, ..., 0       | 1, 1, ..., 1     ]
+            #        └── prompt 部分不计算损失 ┘└── response 部分才计算损失 ┘
+            #
+            # 为什么 prompt 部分要掩码掉？
+            # GRPO 只奖励/惩罚模型「生成的回答」，而 prompt 是给定的输入上下文，
+            # 它的出现概率不应参与策略梯度的更新（否则会把模型本身不需要预测的内容也纳入损失）。
+            #
+            # ── 具体数据形态示例（沿用上面 "3+5=?" "8" 的例子） ──
+            #   ids（15 个整数）：
+            #     [2922,13093,25,198,18,10,30,28,198,198,2922,18261,25,198, 26]
+            #      └──────────────────── 14 个 prompt token ────────────────┘ └─ 1 个 response token("8")
+            #   mask（15 个 0/1，一一对应 ids 的每个位置）：
+            #     [0,   0,    0, 0,  0, 0, 0, 0, 0,  0,  0,   0,    0, 0,   1]
+            # ─────────────────────────────────────────────────────────────
             ids = prompt_ids + response_ids
             mask = [0] * len(prompt_ids) + [1] * len(response_ids)
 
             all_ids.append(ids)
             all_masks.append(mask)
-
-        # 填充
-        max_len = max(len(ids) for ids in all_ids)
+            
+        # ─────────────────────────────────────────────────────────────────
+        # 步骤 3：Padding 填充对齐 —— 让批次中每个样本的长度一致（取最大值）
+        # DataLoader 要求 batch 内每个 Tensor 形状相同，因此短序列末尾补 0。
+        # 这里的 0 只是纯填充值（并不代表真实词表中的 token），
+        # 因为对应的 mask 会同时补 0，因此这些填充位不会参与损失计算，对训练无影响。
+        #
+        # ── 具体数据案例：假设 all_ids / all_masks 里有 2 个样本 ──
+        # 样本 A（短，回答 "8"，单 token）：
+        #   ids_A  = [2922,13093,25,198,18,10,30,28,198,198,2922,18261,25,198, 26]  (len=15)
+        #   mask_A = [0,   0,    0, 0,  0, 0, 0, 0, 0,  0,  0,   0,    0, 0,   1]
+        #
+        # 样本 B（长，回答 "17"，双 token "1"+"7"）：
+        #   ids_B  = [2922,13093,25,198,19,10,26,28,198,198,2922,18261,25,198, 16, 28]  (len=16)
+        #   mask_B = [0,   0,    0, 0,  0, 0, 0, 0, 0,  0,  0,   0,    0, 0,   1,  1]
+        #
+        # → max_len = max(15, 16) = 16
+        #
+        # 样本 A 需要补 pad_len=16-15=1 个 0：
+        #   padded_ids_A   = [2922,13093,25,198,18,10,30,28,198,198,2922,18261,25,198,26, 0]
+        #   padded_masks_A = [0,   0,    0, 0,  0, 0, 0, 0, 0,  0,  0,   0,    0, 0, 1, 0]
+        #                                                                └─ 补了 1 个 0 ┘
+        #
+        # 样本 B 已经是最长，补 pad_len=0 个 0：
+        #   padded_ids_B   = [2922,13093,25,198,19,10,26,28,198,198,2922,18261,25,198,16,28]
+        #   padded_masks_B = [0,   0,    0, 0,  0, 0, 0, 0, 0,  0,  0,   0,    0, 0, 1,  1]
+        #
+        # 最终 padded_ids / padded_masks 中的每个子 list 长度都 = 16，
+        # 才能拼成 (2, 16) 的矩形 Tensor。
+        # ─────────────────────────────────────────────────────────────────
+        max_len = max(len(ids) for ids in all_ids)   # 批次中最长序列的 token 数
         padded_ids = []
         padded_masks = []
         for ids, mask in zip(all_ids, all_masks):
-            pad_len = max_len - len(ids)
-            padded_ids.append(ids + [0] * pad_len)
-            padded_masks.append(mask + [0] * pad_len)
+            pad_len = max_len - len(ids)             # 当前样本需要补的 0 的个数
+            padded_ids.append(ids + [0] * pad_len)   # 序列尾部填充 0
+            padded_masks.append(mask + [0] * pad_len)# 填充位置的 mask 也设为 0（不参与损失）
+
 
         ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
         mask = torch.tensor(padded_masks, dtype=torch.float, device=device)
@@ -66,7 +146,13 @@ class GRPODataset(Dataset):
         return ids, mask
 
 
-# 奖励函数
+# 奖励函数：判断模型生成的回答是否与真实答案一致，返回 0/1 二元奖励
+#   ground_truth: int，正确的数学答案（如 8）
+#   response    : str，模型生成的原始文本（如 "8"、"答案是17"、"abc" 等）
+#   思路：用正则提取 response 中所有整数，取**最后一个**作预测值，与 ground_truth 对比
+#   例：ground_truth=8, response="答案是 8" → matches=["8"]     → predicted=8 → 奖励 1.0
+#   例：ground_truth=17,response="15 不对，应该是 17"→ matches=["15","17"]→取最后 17→奖励 1.0
+#   例：ground_truth=3, response="xyz"       → matches=[]      → 无数字    → 奖励 0.0
 def calculate_reward(ground_truth, response):
     try:
         matches = re.findall(r'(-?\d+)', response)
