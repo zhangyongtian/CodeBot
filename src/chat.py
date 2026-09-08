@@ -16,9 +16,9 @@ device = get_device()
 # 使用基于项目根目录的绝对路径，统一存放于 models/ 文件夹
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 # SFT 模型路径（监督微调）
-model_path = os.path.join(PROJECT_ROOT, 'models', 'model_sft.pt')
+# model_path = os.path.join(PROJECT_ROOT, 'models', 'model_sft.pt')
 # GRPO 模型路径（强化学习微调）
-# model_path = os.path.join(PROJECT_ROOT, 'models', 'model_grpo.pt')
+model_path = os.path.join(PROJECT_ROOT, 'models', 'model_grpo.pt')
 max_new_tokens = 200
 temperature = 1.0
 
