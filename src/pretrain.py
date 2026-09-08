@@ -86,6 +86,21 @@ model = GPT(
     ff_dim=ff_dim,
     dropout_rate=dropout_rate
 ).to(device)
+# AdamW 优化器：GPT/Transformer 训练的标配
+#   【生活类比】把训练比作下山找 Loss 最低点：
+#     SGD      = 闭眼瞎走，遇平路不动、遇山脊晃
+#     Momentum = 带惯性的球，冲过小坑但容易冲过头
+#     AdamW    = 带导航+刹车的老司机：记住历史坡度(一阶动量)、路面颠簸(二阶动量)自适应调步长，
+#                再加上独立的"权重衰减"手刹定期拉一下，防止参数长太大过拟合
+#
+#   【公式】设 t 时刻梯度 g_t = dLoss/dW，执行：
+#     1. 一阶动量（惯性，平均坡度）  m_t = β₁·m_{t-1} + (1-β₁)·g_t           β₁=0.9
+#     2. 二阶动量（颠簸，梯度平方）  v_t = β₂·v_{t-1} + (1-β₂)·g_t²          β₂=0.999
+#     3. 偏差修正（初期偏 0 拉回）  m̂_t = m_t/(1-β₁ᵗ),  v̂_t = v_t/(1-β₂ᵗ)
+#     4. 参数更新：
+#        W_t = W_{t-1} - lr · m̂_t/(√v̂_t + ε)  -  lr · λ · W_{t-1}
+#              └───────── Adam 自适应步长 ─────┘  └─ 权重衰减（独立 L2 正则）─┘
+#   为什么选 AdamW：每个参数自动调 lr + 权重衰减独立做 → 泛化好、对 lr 不敏感，3e-4 基本通吃中小 GPT
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 total_params = sum(p.numel() for p in model.parameters())
