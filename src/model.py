@@ -474,22 +474,50 @@ class GPT(nn.Module):
         return logits
 
     def save(self, file_path):
+        """
+        将模型（超参数 + 训练好的权重）打包保存到指定路径。
+        采用「state_dict + 超参数」分离式打包，是 PyTorch 官方推荐的持久化方式：
+          - 好处①：解耦结构与权重，即使模型类代码改动（如加层/改类名）也能单独加载权重
+          - 好处②：纯张量序列化，跨设备/跨代码版本兼容性强
+        """
         checkpoint = {
+            # ─── 权重参数（训练成果，约占 99.9% 文件体积）───
+            # self.state_dict() 返回 OrderedDict，包含模型所有可学习张量：
+            #   token_embed.weight          词嵌入矩阵        [V, E]
+            #   blocks.i.attn.q_proj.weight 第 i 层 Q 投影矩阵 [E, E]
+            #   blocks.i.ffn.fc1.weight     第 i 层 FFN 第一层 [ff_dim, E]
+            #   ... 以及所有 bias、LayerNorm 参数等
+            # 这些是梯度下降训练出来的真正「知识」，推理时缺一不可。
             'model_state_dict': self.state_dict(),
-            'vocab_size': self.vocab_size,
-            'max_context_len': self.max_context_len,
-            'embed_dim': self.embed_dim,
-            'n_head': self.n_head,
-            'n_layer': self.n_layer,
-            'ff_dim': self.ff_dim,
-            'dropout_rate': self.dropout_rate,
+
+            # ─── 超参数（结构描述，几个整数，用于「重建骨架」）───
+            # 这些参数决定了模型张量的形状，加载时必须先知道它们才能实例化空模型。
+            # 若只保存 state_dict 而不保存这些，load 时无法知道每层该造多大。
+            'vocab_size': self.vocab_size,           # 词表大小 V，决定 token_embed / unembed 的维度
+            'max_context_len': self.max_context_len, # 最大上下文长度 C，决定位置嵌入矩阵行数
+            'embed_dim': self.embed_dim,             # 残差流维度 E，决定绝大多数矩阵的列/行
+            'n_head': self.n_head,                   # 注意力头数 H，决定每个头的维度 D=E/H
+            'n_layer': self.n_layer,                 # Transformer 块的数量，决定网络深度
+            'ff_dim': self.ff_dim,                   # FFN 中间层宽度，决定 ffc1/ffc2 的形状
+            'dropout_rate': self.dropout_rate,       # dropout 概率（推理时不生效，但保持配置一致）
         }
+        # 序列化：把整个 checkpoint dict 写入磁盘文件
         torch.save(checkpoint, file_path)
 
     @classmethod
     def load_from(cls, file_path, device='cpu'):
+        """
+        从 checkpoint 文件还原模型（两步走：先搭骨架 → 再灌权重）。
+        @classmethod 的好处是不用先有模型实例即可调用：Transformer.load_from('xxx.pt')
+        """
+        # 第一步：反序列化读取整个 checkpoint dict
+        # map_location=device 确保张量直接落在目标设备上（避免先加载到 GPU 再转到 CPU 的报错）
         checkpoint = torch.load(file_path, map_location=device)
 
+        # ─── 第二步：用超参数「重建空骨架」（此时所有权重都是随机初始化的垃圾值）───
+        # 为什么不直接反序列化出一个 model 对象？
+        #   1. PyTorch 直接 pickle 整个 model 会绑定类路径和类结构，脆弱易崩
+        #   2. 显式用 cls(...) 构造，保证当前代码的模型类定义和权重形状 100% 一致
         model = cls(
             vocab_size=checkpoint['vocab_size'],
             max_context_len=checkpoint['max_context_len'],
@@ -500,7 +528,17 @@ class GPT(nn.Module):
             dropout_rate=checkpoint['dropout_rate']
         )
 
+        # ─── 第三步：把训练好的真实权重「灌进空骨架」，覆盖随机值 ───
+        # load_state_dict 会按 key 严格匹配赋值：
+        #   checkpoint['model_state_dict']['blocks.0.attn.q_proj.weight']
+        #   → 赋值给 model.blocks[0].attn.q_proj.weight
+        # 若形状不匹配或有缺失/多余 key，会抛异常提示，避免静默错误。
         model.load_state_dict(checkpoint['model_state_dict'])
+
+        # 第四步：把整个模型移动到目标设备（CPU / CUDA / MPS）
+        # 虽然 state_dict 已经 map_location 到 device，但 model 对象本身的 .to() 是必须的
+        # 它会递归调用所有子模块和参数的 .to(device)，保证后续 forward 在正确设备上跑。
         model.to(device)
 
+        # 返回：结构正确 + 权重正确 + 设备正确 的可用模型实例
         return model
