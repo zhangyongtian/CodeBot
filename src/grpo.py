@@ -174,6 +174,12 @@ def generate_group(model, tokenizer, prompts, gts, group_size):
         responses = []
         for _ in range(group_size):
             full_text = generate(model, tokenizer, prompt, temperature=1.0)
+            # generate() 返回的是「prompt 原文 + 模型新生成的全部回答」拼接好的完整字符串；
+            # 这里用 full_text[len(prompt):] 按字符长度把开头的 prompt 整体切掉，
+            # 只保留模型在生成阶段真正新输出的回答部分（例如 "8"、"17" 等）。
+            # 例：prompt = "### Instruction:\n3+5=\n\n### Response:\n"
+            #     full_text = "### Instruction:\n3+5=\n\n### Response:\n8"
+            #     response  = "8"
             response = full_text[len(prompt):]
             responses.append(response)
 
