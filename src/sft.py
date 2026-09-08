@@ -27,7 +27,7 @@ device = get_device()
 data_path = os.path.join(DATA_DIR, 'tiny_codes_sft.json')
 pretrain_model_path = os.path.join(MODELS_DIR, 'model_pretrain.pt')
 sft_model_save_path = os.path.join(MODELS_DIR, 'model_sft.pt')
-loss_fig_path = os.path.join(SCRIPT_DIR,"loss_imgs", 'loss_sft.png')
+loss_fig_path = os.path.join(PROJECT_ROOT, 'loss_imgs', 'loss_sft.png')
 
 # 超参数
 context_len = 256

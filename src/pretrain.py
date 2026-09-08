@@ -21,7 +21,7 @@ device = get_device()
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 model_save_path = os.path.join(PROJECT_ROOT, 'models', 'model_pretrain.pt')
 data_file_path = os.path.join(PROJECT_ROOT, 'data', 'tiny_codes.txt')
-loss_fig_path = os.path.join(SCRIPT_DIR,"loss_imgs", 'loss_pretrain.png')
+loss_fig_path = os.path.join(PROJECT_ROOT, 'loss_imgs', 'loss_pretrain.png')
 
 
 context_len = 256
