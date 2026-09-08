@@ -222,14 +222,92 @@ def generate_group(model, tokenizer, prompts, gts, group_size):
 
 
 def compute_probs(model, ids):
-    logits = model(ids)  # (B, C, V)
-    probs = F.softmax(logits[:, :-1, :], dim=-1)  # (B, C-1, V)
-    labels = ids[:, 1:]  # (B, C-1)
+    """
+    计算模型在给定 ids 序列下，每个位置上「真实下一个 token」的生成概率。
+    Teacher Forcing 思路：一次前向得到所有位置预测 → 右移一位的 ids 当 labels → 取对应词的概率。
+    （注意：取到的概率不是用来算交叉熵，而是给 PPO 算 ratio = π_new / π_old 用的）
 
-    token_probs = torch.gather(
-        probs, dim=-1, index=labels.unsqueeze(-1)
-    ).squeeze(-1)  # (B, C-1)
+    参数：
+        model: GPT 模型（新模型 π_θ 或旧模型 π_θ_old）
+        ids  : (B, C)，每个样本的 token ID = prompt_tokens + response_tokens + padding
+    返回：
+        token_probs: (B, C-1)，每个位置 i 上真实 token ids[i+1] 的 softmax 概率（0~1）
+    """
+    # ──────────────────────────────────────────────────────────────────────
+    # 【共用的数字例子】下面每一行代码都复用这个输入：
+    #   B=1（batch 中 1 条样本），C=5（序列长度 5 个 token）
+    #   ids = [18, 10, 30, 26, 0]
+    #        "3"  "+" "5"  "8"  <pad>
+    #   其中 ids[0..2] 是 prompt 段，ids[3] 是回答"8"（response 段），ids[4] 是 padding 填的 0
+    #   词表 V = 50257（GPT-2 BPE 词表大小）
+    #
+    # 【非常关键！】— 因果掩码（Causal Mask）防作弊 —
+    #   Transformer 内部用 torch.tril() 生成下三角 Attention 掩码，
+    #   严格保证：位置 i 上做 Self-Attention 时，**只能看见 ids[0..i]**，
+    #   ids[i+1..] 全部被 mask 成 -∞，等于完全不存在。
+    #   所以：虽然 ids[3]="8" 已经被拼接在输入里，但位置 2 上的预测根本看不见它，
+    #   也就不存在"先看答案再预测"的作弊问题——这是所有自回归 LM（GPT 系列）的标准做法。
+    # ──────────────────────────────────────────────────────────────────────
 
+    # ── 代码行 1：模型前向 ────────────────────────────────────────────────
+    #   执行前 ids.shape = (1, 5)
+    #   执行后 logits.shape = (1, 5, 50257)
+    #   含义：每个位置 b=0, i∈[0..4] 上 logits[0,i,:] 是该位置"预测下一个词"的
+    #         50257 维未归一化分数；以位置 2 举例（ids[2]="5"）：
+    #           此时 Attention 只能看 ids[0..2] = "3","+","5"（后面的 ids[3]="8" 被因果掩码遮住）
+    #           logits[0,2,:] 的输出就是"看到 3+5= 之后，预测下一个词应该是什么"的分数
+    #           其中 index=26（即"8"）这个位置的分数，正是我们后面 PPO 要取值的目标
+    logits = model(ids)
+
+    # ── 代码行 2：softmax + 丢弃末尾位置 ─────────────────────────────────
+    #   执行前 logits.shape = (1, 5, 50257)
+    #   步骤 A：logits[:, :-1, :] → shape (1, 4, 50257)
+    #           丢掉位置 4（最后一个位置没有"下一个 token"可预测）
+    #   步骤 B：softmax(dim=-1) → 每个位置的 50257 维分数归一化成概率分布（和为 1）
+    #   执行后 probs.shape = (1, 4, 50257)
+    #   例：probs[0, 2, 26] 就是位置 2 上预测 token 26("8")的概率（比如 0.78）
+    probs = F.softmax(logits[:, :-1, :], dim=-1)
+
+    # ── 代码行 3：labels = ids 右移一位（Teacher Forcing 标签） ───────────
+    #   执行前 ids.shape = (1, 5)
+    #   ids[:, 1:] 取下标 1..4 共 4 个位置 → shape (1, 4)
+    #   按例子计算：labels[0] = [ids[1], ids[2], ids[3], ids[4]]
+    #                        = [  10,     30,     26,       0   ]
+    #                        = [ "+",   "5",   "8",  "<pad>" ]
+    #   含义：位置 i 应该"负责预测"的正确 token 就是 ids[i+1]
+    labels = ids[:, 1:]
+
+    # ── 代码行 4-1：labels.unsqueeze(-1)（为 gather 凑维度） ──────────────
+    #   执行前 labels.shape = (1, 4)
+    #   unsqueeze(-1) 在最后一维插入一个新轴 → shape (1, 4, 1)
+    #   按例子：labels_idx[0] = [[10], [30], [26], [0]]
+    #   原因：torch.gather 要求 index 的 dim 数和源 Tensor 相同（都要 3 维）
+    labels_idx = labels.unsqueeze(-1)
+
+    # ── 代码行 4-2：torch.gather（从 50257 维概率里取出真实 token 的概率） ─
+    #   输入：
+    #     probs      shape = (1, 4, 50257)    在 dim=-1 上做索引
+    #     labels_idx shape = (1, 4, 1)        每个 (b,i) 处要取的词表下标
+    #   规则：输出[b,i,0] = probs[b, i, labels_idx[b,i,0]]
+    #   按例子计算（只看 b=0，B=1）：
+    #     position 0：labels_idx=10 → 取 probs[0,0,10] = 位置 0 预测 token 10 "+" 的概率
+    #     position 1：labels_idx=30 → 取 probs[0,1,30] = 位置 1 预测 token 30 "5" 的概率
+    #     position 2：labels_idx=26 → 取 probs[0,2,26] = 位置 2 预测 token 26 "8" 的概率  ★ 回答"8"的概率（response段，mask=1）
+    #     position 3：labels_idx=0  → 取 probs[0,3, 0] = 位置 3 预测 token  0  pad  的概率
+    #   执行后 gathered.shape = (1, 4, 1)
+    gathered = torch.gather(probs, dim=-1, index=labels_idx)
+
+    # ── 代码行 4-3：squeeze(-1) → 最终 token_probs ───────────────────────
+    #   执行前 gathered.shape = (1, 4, 1)
+    #   squeeze(-1) 消掉最后一维 → shape (1, 4)
+    #   按例子的一个可能数值（0~1 的概率值）：
+    #     token_probs[0] = [0.95,   0.92,   0.78,   0.01  ]
+    #                      p_"+"  p_"5"  p_"8"  p_<pad>
+    #     对应的 mask:    [0,      0,      1,      0     ]
+    #                    prompt段 不参与损失  response段 ★ 参与损失  pad段 不参与
+    token_probs = gathered.squeeze(-1)
+
+    #   最终返回：shape (B, C-1) = (1, 4)
     return token_probs
 
 
