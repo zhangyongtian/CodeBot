@@ -17,9 +17,9 @@ from utils import get_device
 import tiktoken
 
 device = get_device()
-# 使用基于脚本位置的绝对路径，避免工作目录不同导致找不到文件
-model_save_path = os.path.join(SCRIPT_DIR, 'models', 'model_pretrain.pt')
+# 使用基于项目根目录的绝对路径，避免工作目录不同导致找不到文件
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+model_save_path = os.path.join(PROJECT_ROOT, 'models', 'model_pretrain.pt')
 data_file_path = os.path.join(PROJECT_ROOT, 'data', 'tiny_codes.txt')
 loss_fig_path = os.path.join(SCRIPT_DIR, 'loss_pretrain.png')
 
