@@ -138,7 +138,6 @@ logs/
 *.jsonl
 *.parquet
 *.tfrecord
-data/
 dataset/
 datasets/
 
