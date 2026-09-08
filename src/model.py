@@ -329,67 +329,147 @@ class FFN(nn.Module):
 
 
 class Block(nn.Module):
+    """Transformer Block（Pre-LN 残差结构，GPT 标准做法）。
+    子层顺序：Norm → 子层(MHA/FFN) → 残差相加，而不是 Post-LN 的 子层→Norm→残差。
+    Pre-LN 的好处：深层模型训练更稳定，无需复杂 warm-up 即可收敛。
+    """
     def __init__(self, embed_dim, n_head, ff_dim, dropout_rate=0.1):
         super().__init__()
+        # 每个注意力头的维度 = 嵌入维度 ÷ 头数（保证 H*D = E，拼接后维度对齐残差）
         head_dim = embed_dim // n_head
+        # norm1：进入 MultiHeadAttention 之前的 LayerNorm（Pre-LN 第一处）
+        #   输入 shape = (B, C, E) → 输出 shape = (B, C, E)，数值分布被归一化到均值0方差1
         self.norm1 = nn.LayerNorm(embed_dim)  # LayerNorm(embed_dim)
+        # attn：多头自注意力子层
+        #   输入 shape = (B, C, E) → 输出 shape = (B, C, E)
+        #   返回值：每个 token 融合了句子中所有可见 token（≤自己位置）信息的上下文感知表示
         self.attn = MultiHeadAttention(embed_dim, n_head, head_dim, dropout_rate)
+        # norm2：进入 FFN 之前的 LayerNorm（Pre-LN 第二处）
+        #   输入 shape = (B, C, E) → 输出 shape = (B, C, E)
         self.norm2 = nn.LayerNorm(embed_dim)  # LayerNorm(embed_dim)
+        # ffn：前馈网络子层（Position-wise FFN）
+        #   输入 shape = (B, C, E) → 输出 shape = (B, C, E)
+        #   返回值：每个 token 独立经过升维→GELU→降维后的非线性变换表示，
+        #   与注意力的"跨 token 搬信息"形成互补
         self.ffn = FFN(embed_dim, ff_dim, dropout_rate)
 
     def forward(self, x):
+        # 残差支路①：先 Norm 再 MHA，再与原始 x 相加
+        #   self.norm1(x)      → (B, C, E)  归一化后的 x
+        #   self.attn(...)     → (B, C, E)  注意力输出：融合了上下文信息
+        #   x + attn(...)      → (B, C, E)  残差相加：原始 x + 上下文增量
+        #     好处：梯度直接走残差支路传回浅层，解决深层网络梯度消失
         x = x + self.attn(self.norm1(x))
+        # 残差支路②：先 Norm 再 FFN，再与上一步结果相加
+        #   self.norm2(x)      → (B, C, E)  对上一步输出做第二次归一化
+        #   self.ffn(...)      → (B, C, E)  FFN 输出：单 token 非线性加工
+        #   x + ffn(...)       → (B, C, E)  残差相加：保持维度不变，信息流畅通
         x = x + self.ffn(self.norm2(x))
+        # 返回整层 Block 处理完的表示，维度和输入完全一致 (B, C, E)，
+        # 这样下一层 Block 可以直接复用，无需额外维度对齐
         return x
 
 
 class GPT(nn.Module):
+    """GPT 自回归语言模型主类（Decoder-Only Transformer）。
+    核心结构：词嵌入 + 位置嵌入 → n_layer 个 Transformer Block（Pre-LN 残差）
+           → Final LayerNorm → unembed（权重共享）→ vocab 维度 logits。
+    """
     def __init__(self, vocab_size, max_context_len, embed_dim, n_head, n_layer, ff_dim, dropout_rate):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.max_context_len = max_context_len
-        self.embed_dim = embed_dim
-        self.n_head = n_head
-        self.n_layer = n_layer
-        self.ff_dim = ff_dim
-        self.dropout_rate = dropout_rate
+        # --- 保存超参数（用于 save/load 时恢复模型结构）---
+        self.vocab_size = vocab_size      # 词表大小 V：token id 的取值范围是 [0, V-1]
+        self.max_context_len = max_context_len  # 最大上下文长度：训练/推理时允许的最长序列
+        self.embed_dim = embed_dim        # 嵌入维度 E：每个 token 的向量表示维度
+        self.n_head = n_head              # 注意力头数 H：MultiHeadAttention 并行头数
+        self.n_layer = n_layer            # Transformer Block 堆叠层数：决定模型深度
+        self.ff_dim = ff_dim              # FFN 隐层维度：通常取 4×E，升维增强表达能力
+        self.dropout_rate = dropout_rate  # Dropout 概率：正则化强度
 
+        # --- 嵌入层 ---
+        # 词嵌入矩阵：把离散的 token id (整数) 映射为连续的 E 维语义向量
+        #   输入 shape = (B, C) 整数 → 输出 shape = (B, C, E) 浮点数
+        #   本质：查表操作，weight shape = (vocab_size, E)
+        #   语义相近的词，其向量在空间中也接近（训练中学到）
         self.embed = nn.Embedding(vocab_size, embed_dim)
+        # 位置嵌入矩阵：把"第几个位置的 token"映射为 E 维位置向量
+        #   输入 shape = (C,) 整数 [0,1,..C-1] → 输出 shape = (C, E)
+        #   本质：可学习的位置编码，显式告诉模型 token 的顺序
+        #   作用：注意力本身无序（对排列等变），必须靠位置编码提供语序信息
         self.pos_embed = nn.Embedding(max_context_len, embed_dim)
+        # 嵌入融合后的 Dropout：嵌入层 + 位置嵌入相加后随机部分输出，防止过拟合
         self.dropout = nn.Dropout(dropout_rate)
 
+        # --- Transformer Block 堆叠 ---
+        # n_layer 层的 Block 列表，逐层处理；每层输入输出 shape 都是 (B, C, E)
+        # 用 ModuleList 而非普通 list：这样参数会被注册到模型中，model.parameters() 才能拿到
         self.blocks = nn.ModuleList([
             Block(embed_dim, n_head, ff_dim, dropout_rate)
             for _ in range(n_layer)
         ])
 
+        # --- 输出端 ---
+        # Final LayerNorm：所有 Block 走完之后的最后一次归一化
+        #   Pre-LN 结构残差分支始终没被 Norm，输出端数值分布可能漂移，
+        #   用这一层把 (B, C, E) 再拉回均值 0 方差 1，稳定送入 unembed
         self.norm = nn.LayerNorm(embed_dim)
+        # unembed 投影层：把 E 维语义向量 → vocab_size 维 logits（每个词的分数）
+        #   weight shape = (vocab_size, embed_dim)（nn.Linear 的 weight 是 out×in）
+        #   作用：相当于"反向查表"，给每个词表位置打分，后续 softmax 得到词概率
         self.unembed = nn.Linear(embed_dim, vocab_size)
 
+        # 权重共享（Weight Tying）：让词嵌入与 unembed 分类矩阵共用同一份权重
+        #   - 省一半参数（两个 (V,E) 大矩阵合并为一个）
+        #   - 语义对齐："词 i 被编码成什么向量"和"什么向量被解码为词 i"完全一致，泛化更好
+        #   - 正则化：约束自由度，抑制过拟合；GPT-2/GPT-3/LLaMA 均采用
         self.embed.weight = self.unembed.weight
+        # 递归初始化所有子模块参数：model.apply(fn) 会深度优先遍历所有子 module
+        #   覆盖：所有 nn.Linear(W_q/W_k/W_v/W_o/FFN/unembed) + nn.Embedding(embed/pos_embed)
+        #   保证整个模型使用 GPT-2 官方推荐的 std=0.02 正态初始化开局
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        """GPT-2 风格的参数初始化：Linear/Embedding 权重用 N(0, 0.02²)，Linear bias 置 0。
+        被 self.apply(...) 递归调用到每个子模块上。
+        """
         if isinstance(module, nn.Linear):
+            # 线性层权重：均值为 0、标准差 0.02 的正态分布初始化
+            # 选择 0.02 的原因：在 E=768 等常用尺度下，初始激活方差≈1，配合 LayerNorm 稳定
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
+                # 线性层偏置：全 0 初始化（不提供初始偏移，让残差一开始就是 identity）
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
+            # 嵌入层（词嵌入 + 位置嵌入）：与 Linear 相同的 N(0, 0.02²) 初始化
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, ids):
+        """前向传播：输入 token id (B, C)，输出下一个词的 logits (B, C, V)。
+        注意：logits[b][c] 表示"在第 b 条句子的前 c+1 个 token 上下文下，预测第 c+1 个 token 的分数"，
+        训练时与 ids[b][c+1] 做交叉熵 loss（自回归目标）。
+        """
+        # 从输入 id 张量中解包 batch 大小 B 和当前序列长度 C
         B, C = ids.shape
         device = ids.device
 
+        # 生成位置索引 [0, 1, 2, ..., C-1]，作为位置嵌入的输入
         pos = torch.arange(0, C, dtype=torch.long, device=device)
+        # 词嵌入：查 (B, C) 次表，得到每个 token 的语义向量 (B, C, E)
         emb = self.embed(ids)
+        # 位置嵌入：查 C 次表，得到每个位置的向量 (C, E)，广播到 (B, C, E) 与 emb 相加
         pos_emb = self.pos_embed(pos)
+        # 融合：语义 + 位置 逐元素相加，再经 Dropout 正则后得到模型输入 x (B, C, E)
         x = self.dropout(emb + pos_emb)
 
+        # 逐层通过 n_layer 个 Transformer Block；每层保持 shape = (B, C, E) 不变
+        # 每一层：MHA 跨 token 融上下文 → FFN 单 token 做非线性加工，信息逐级抽象
         for block in self.blocks:
             x = block(x)
+        # Final LayerNorm：n_layer 层残差累加后数值可能飘，统一拉回标准分布 (B, C, E)
         x = self.norm(x)
 
+        # unembed：每个 token 位置的 E 维表示线性投影到 V 维词表空间，得到 logits
+        #   logits[b][c][v] = 第 b 条句子第 c 个位置预测词 v 为下一个词的未归一化分数
         logits = self.unembed(x)
         return logits
 
