@@ -64,6 +64,15 @@ with open(data_file_path, "r", encoding="utf-8") as f:
     text = f.read()
 
 dataset = TokenDataset(text, context_len)
+# DataLoader 工作流程示意（L = dataset.__len__() = 总样本数，context_len = 256）：
+#   ① 生成全部合法 idx： [0, 1, 2, 3, 4, 5, 6, 7, ..., L-1]    ← 共 L 个，范围由 __len__ 限定
+#   ② shuffle=True 打乱：[305, 12, 8888, 0, 777, 42, ...]       ← 还是 L 个，顺序随机，降低样本相关性
+#   ③ 按 batch_size=16 连续分组：
+#        第 1 个 batch → 取前 16 个 idx  → 各自调用 __getitem__ → 拼接为 batch_x/batch_y，shape (16, 256)
+#        第 2 个 batch → 取接下来 16 个 idx → 同样拼接为 (16, 256)
+#        ...
+#        最后 1 个 batch → 剩余不足 16 条时就按实际条数返回（若 drop_last=True 则会丢弃）
+#   每个 epoch 遍历完 L 条样本后会重新执行 ② 和 ③ 再次打乱分组
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
@@ -82,23 +91,37 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 total_params = sum(p.numel() for p in model.parameters())
 print(f"参数总数: {total_params:,} ({total_params/1e6:.1f}M)")
 
-losses = []
-data_iter = cycle(dataloader)  # 转换为无限循环
+losses = []                                               # 记录每一步(iter)的训练 Loss，最后用于画曲线
+# 把 dataloader 包装为无限迭代器：跑完一个 epoch(共 L 条样本)后自动重新 shuffle + 分 batch，无缝从头再来
+# 主循环按固定的 max_iters 步数训练，无需手动管理 epoch 边界和迭代器重建
+data_iter = cycle(dataloader)
+# tqdm 进度条，长度 = max_iters = 20000；每完成一步(=处理一个 batch = 参数更新一次)进度条前进一格
 pbar = tqdm(range(max_iters))
 
+# 训练主循环：每一次 for 循环 = 1 iter = 1 个 batch = 参数通过 AdamW 更新 1 次
 for i in pbar:
+    # ---------- 1. 取一个 batch 并迁移到目标设备(GPU/CPU) ----------
+    # 从无限迭代器拿 1 个 batch：batch_x / batch_y 的 shape 都是 (batch_size, context_len) = (16, 256)
     batch_x, batch_y = next(data_iter)
+    # 将数据迁移到与 model.parameters() 相同的设备，否则 CPU/GPU 张量混算会直接报错
     batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
+    # ---------- 2. 前向传播 + 计算 Loss ----------
+    # 前向：输入 (B, T) 的 token id → 模型输出 (B, T, vocab_size) 的每个位置所有词的打分(logits)
     logits = model(batch_x)
+    # 交叉熵：把 (B,T) 展平成 (B*T,) 的二维分类问题——所有样本、所有位置都参与"预测下一个词"的监督
+    #   logits.view(-1, vocab_size) : (B, T, V) -> (B*T, V) 每一行 = 某位置所有词的得分
+    #   batch_y.view(-1)            : (B, T)    -> (B*T,)    每个位置的真实词 id
     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), batch_y.view(-1))
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    # ---------- 3. 反向传播 + 优化器更新参数 ----------
+    optimizer.zero_grad()                          # 清空上一步累积的梯度(PyTorch 默认累加，不清空会越叠越大)
+    loss.backward()                                # 反向：从 Loss 开始沿计算图对所有可训练参数求梯度 dL/dW
+    optimizer.step()                               # 更新：AdamW 根据梯度和学习率更新所有参数 W = W - lr*AdamW_update
 
-    losses.append(loss.item())
-    pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    # ---------- 4. 记录当前步 Loss，刷新进度条右侧显示 ----------
+    losses.append(loss.item())                     # loss.item() 把单元素张量转成 Python 标量，避免显存累积
+    pbar.set_postfix({'loss': f'{loss.item():.4f}'})  # 在 tqdm 进度条末尾实时显示当前 Loss(4 位小数)
 
 # 保存结果
 plt.figure(figsize=(10, 6))
